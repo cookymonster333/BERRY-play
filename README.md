@@ -1,2 +1,5 @@
-this program is FREE and WILL ALWAYS BE FREE cuz its made by ai, let me explain.
-i whas wondering how far ai whas with coding and wanted a music player for my mp3 and 4 files and that got a bit out of hand, so that is how BERRY play is made!
+This program is FREE and WILL ALWAYS BE FREE because it's MADE BY AI. Let me explain.
+
+I was wondering how far AI had gotten with coding, and I wanted a music player for my MP3 and MP4 files. That got a bit out of hand, so that's how BERRY play was made!
+
+BERRY play is just a personal project, so don't expect frequent updates!!
