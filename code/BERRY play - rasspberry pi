@@ -1,0 +1,808 @@
+#!/usr/bin/env python3
+"""
+BERRY play Player (Full Screen Version for Raspberry Pi)
+========================================================
+A single-window, full-screen media player optimized for Raspberry Pi 3 A+.
+"""
+
+import os
+import sys
+import string
+import random
+import socket
+import subprocess
+import time
+import threading
+import ctypes
+import shutil
+import tkinter as tk
+from tkinter import messagebox
+
+DRIVE_NAME = "BERRY play"
+SEARCH_DIRS = ["/media", "/mnt"]   # Linux/Pi: where drives auto-mount
+POLL_SECONDS = 2                   # how often to check if drive is plugged in
+PLAYABLE_EXTENSIONS = (".mp3", ".mp4")
+
+IS_WINDOWS = os.name == "nt"
+
+WINDOWS_VLC_PATHS = [
+    r"C:\Program Files\VideoLAN\VLC\vlc.exe",
+    r"C:\Program Files (x86)\VideoLAN\VLC\vlc.exe",
+]
+
+# ---------------------------------------------------------------------------
+# Minimal dark colour palette
+# ---------------------------------------------------------------------------
+BG = "#1c1c1c"          # main background
+BG_PANEL = "#242424"    # slightly lighter panels (listbox, control bar)
+FG = "#e4e4e4"          # normal text
+FG_MUTED = "#8a8a8a"    # secondary / status text
+ACCENT = "#4caf82"      # active/toggle highlight
+ACCENT_BG = "#20362c"   # active toggle button background
+DANGER = "#c0524a"      # quit button
+BORDER_COLOR = "#ffffff"
+
+# Adjusted larger fonts for Raspberry Pi displays
+FONT = ("DejaVu Sans", 12)
+FONT_SMALL = ("DejaVu Sans", 10)
+FONT_LARGE = ("DejaVu Sans", 14, "bold")
+
+
+def flat_button(parent, **kwargs):
+    """A tk.Button pre-styled to look flat and touch-friendly."""
+    defaults = dict(
+        bg=BG_PANEL, fg=FG, activebackground=BG_PANEL, activeforeground=ACCENT,
+        relief="flat", bd=0, highlightthickness=0, font=FONT, padx=12, pady=8,
+        cursor="hand2",
+    )
+    defaults.update(kwargs)
+    return tk.Button(parent, **defaults)
+
+
+def find_drive_path():
+    if IS_WINDOWS:
+        return _find_drive_windows()
+    return _find_drive_linux()
+
+
+def _find_drive_windows():
+    kernel32 = ctypes.windll.kernel32
+    bitmask = kernel32.GetLogicalDrives()
+    for i, letter in enumerate(string.ascii_uppercase):
+        if bitmask & (1 << i):
+            drive = f"{letter}:\\"
+            name_buf = ctypes.create_unicode_buffer(1024)
+            kernel32.GetVolumeInformationW(
+                ctypes.c_wchar_p(drive), name_buf, ctypes.sizeof(name_buf),
+                None, None, None, None, 0
+            )
+            if name_buf.value.upper() == DRIVE_NAME.upper():
+                return drive
+    return None
+
+
+def _find_drive_linux():
+    for base in SEARCH_DIRS:
+        if not os.path.isdir(base):
+            continue
+        candidates = [base] + [
+            os.path.join(base, d) for d in os.listdir(base)
+            if os.path.isdir(os.path.join(base, d))
+        ]
+        for folder in candidates:
+            try:
+                for entry in os.listdir(folder):
+                    full = os.path.join(folder, entry)
+                    if os.path.isdir(full) and entry.upper() == DRIVE_NAME.upper():
+                        return full
+            except PermissionError:
+                continue
+    return None
+
+
+def find_vlc():
+    if IS_WINDOWS:
+        for path in WINDOWS_VLC_PATHS:
+            if os.path.isfile(path):
+                return path
+        vlc_in_path = shutil.which("vlc.exe") or shutil.which("vlc")
+        if vlc_in_path:
+            return vlc_in_path
+        return None
+    else:
+        return shutil.which("cvlc") or shutil.which("vlc") or "vlc"
+
+
+def get_free_port():
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+SW_HIDE = 0
+SW_MINIMIZE = 6
+SW_RESTORE = 9
+CONSOLE_HWND = None
+
+
+def _find_windows_for_pid(pid):
+    hwnds = []
+    user32 = ctypes.windll.user32
+    EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_int, ctypes.c_int)
+
+    def enum_handler(hwnd, lparam):
+        wnd_pid = ctypes.c_ulong()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(wnd_pid))
+        if wnd_pid.value == pid and user32.IsWindowVisible(hwnd):
+            hwnds.append(hwnd)
+        return True
+
+    user32.EnumWindows(EnumWindowsProc(enum_handler), 0)
+    return hwnds
+
+
+def set_process_window_state(pid, minimize=True):
+    if not IS_WINDOWS or not pid:
+        return
+    user32 = ctypes.windll.user32
+    for hwnd in _find_windows_for_pid(pid):
+        user32.ShowWindow(hwnd, SW_MINIMIZE if minimize else SW_RESTORE)
+
+
+def wait_and_minimize_process_window(pid, find_attempts=20, find_delay=0.15,
+                                      reinforce_attempts=6, reinforce_delay=0.15):
+    if not IS_WINDOWS or not pid:
+        return
+    found = False
+    for _ in range(find_attempts):
+        if _find_windows_for_pid(pid):
+            found = True
+            break
+        time.sleep(find_delay)
+    if not found:
+        return
+    for _ in range(reinforce_attempts):
+        set_process_window_state(pid, minimize=True)
+        time.sleep(reinforce_delay)
+
+
+def hide_console_window():
+    if not IS_WINDOWS:
+        return
+    global CONSOLE_HWND
+    hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+    if hwnd:
+        CONSOLE_HWND = hwnd
+        ctypes.windll.user32.ShowWindow(hwnd, SW_HIDE)
+
+
+class PlayerApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("BERRY play Player")
+
+        # Enable Native Full Screen for Raspberry Pi / Linux
+        self.attributes("-fullscreen", True)
+        self.attributes("-topmost", True)
+        self.configure(bg=BG)
+
+        # Container Frame
+        self.container = tk.Frame(self, bg=BG)
+        self.container.pack(fill="both", expand=True, padx=8, pady=8)
+
+        # Keybindings to easily control/exit full screen on Pi
+        self.bind("<Control-q>", lambda e: self.control_quit())
+        self.bind("<Escape>", lambda e: self.handle_escape())
+
+        # --- Top Controls & Info Bar ---
+        self.control_panel = tk.Frame(self.container, bg=BG_PANEL, padx=12, pady=10)
+        self.control_panel.pack(fill="x", side="top")
+
+        now_playing_row = tk.Frame(self.control_panel, bg=BG_PANEL)
+        now_playing_row.pack(fill="x", pady=(0, 8))
+
+        self.now_playing_label = tk.Label(
+            now_playing_row, text="Nothing playing", fg=FG, bg=BG_PANEL,
+            font=FONT_LARGE, anchor="w"
+        )
+        self.now_playing_label.pack(side="left", expand=True, fill="x")
+
+        self.location_label = tk.Label(
+            now_playing_row, text="", fg=FG_MUTED, bg=BG_PANEL,
+            font=FONT_SMALL, anchor="e"
+        )
+        self.location_label.pack(side="right", fill="x")
+
+        # Control buttons row
+        btn_frame = tk.Frame(self.control_panel, bg=BG_PANEL)
+        btn_frame.pack(anchor="w")
+
+        self.vlc_button = flat_button(
+            btn_frame, text="VLC", command=self.toggle_player_visibility,
+            font=FONT, padx=10, pady=5
+        )
+        self.vlc_button.pack(side="left", padx=(0, 6))
+
+        self.back_button = flat_button(
+            btn_frame, text="⏮", command=self.control_back,
+            font=FONT, padx=10, pady=5
+        )
+        self.back_button.pack(side="left", padx=2)
+
+        self.playpause_button = flat_button(
+            btn_frame, text="⏸", command=self.control_toggle_playpause,
+            font=FONT, padx=10, pady=5
+        )
+        self.playpause_button.pack(side="left", padx=2)
+
+        self.next_button = flat_button(
+            btn_frame, text="⏭", command=self.control_next,
+            font=FONT, padx=10, pady=5
+        )
+        self.next_button.pack(side="left", padx=2)
+
+        self.autoplay_button = flat_button(
+            btn_frame, text="Auto", command=self.toggle_autoplay, font=FONT, padx=10, pady=5
+        )
+        self.autoplay_button.pack(side="left", padx=(12, 2))
+
+        self.shuffle_button = flat_button(
+            btn_frame, text="Shuffle", command=self.toggle_shuffle, font=FONT, padx=10, pady=5
+        )
+        self.shuffle_button.pack(side="left", padx=2)
+
+        self.quit_button = flat_button(
+            btn_frame, text="✕", command=self.control_quit,
+            font=FONT, padx=12, pady=5, fg=DANGER, activeforeground=DANGER
+        )
+        self.quit_button.pack(side="right", padx=(12, 0))
+
+        # --- Integrated Progress Bar ---
+        self.progress_canvas = tk.Canvas(
+            self.container, height=6, bg=BG_PANEL, highlightthickness=0, bd=0
+        )
+        self.progress_canvas.pack(fill="x")
+        self.progress_fill = self.progress_canvas.create_rectangle(
+            0, 0, 0, 6, fill=ACCENT, outline=""
+        )
+
+        # --- Status & Drive Path ---
+        self.status_label = tk.Label(
+            self.container, text="Looking for BERRY play drive...",
+            bg=BG, fg=FG_MUTED, font=FONT_SMALL, anchor="w"
+        )
+        self.status_label.pack(fill="x", padx=10, pady=(12, 2))
+
+        nav_frame = tk.Frame(self.container, bg=BG)
+        nav_frame.pack(fill="x", padx=10)
+        self.path_label = tk.Label(nav_frame, text="", bg=BG, fg=FG_MUTED, font=FONT_SMALL, anchor="w")
+        self.path_label.pack(side="left")
+
+        # --- Search Bar ---
+        search_frame = tk.Frame(self.container, bg=BG)
+        search_frame.pack(fill="x", padx=10, pady=(10, 6))
+        tk.Label(search_frame, text="🔍", bg=BG, fg=FG_MUTED, font=FONT).pack(side="left", padx=(0, 6))
+
+        self.search_var = tk.StringVar()
+        self.search_var.trace_add("write", lambda *args: self.apply_filter())
+        self.search_entry = tk.Entry(
+            search_frame, textvariable=self.search_var, bg=BG_PANEL, fg=FG,
+            insertbackground=FG, relief="flat", font=FONT,
+            highlightthickness=1, highlightbackground=BG_PANEL, highlightcolor=ACCENT,
+        )
+        self.search_entry.pack(side="left", fill="x", expand=True, ipady=6)
+
+        # --- File Browser Listbox ---
+        self.listbox = tk.Listbox(
+            self.container, bg=BG_PANEL, fg=FG, font=FONT, bd=0, highlightthickness=0,
+            selectbackground=ACCENT_BG, selectforeground=ACCENT, activestyle="none",
+        )
+        self.listbox.pack(fill="both", expand=True, padx=10, pady=10)
+        self.listbox.bind("<Double-Button-1>", lambda e: self.open_selected())
+        self.listbox.bind("<Return>", lambda e: self.open_selected())
+
+        # State Variables
+        self._marquee_job = None
+        self._marquee_text = ""
+        self._marquee_pos = 0
+        self._progress_job = None
+        self._progress_length = 0.0
+        self._dots_job = None
+        self._dots_count = 0
+
+        self.root_path = None
+        self.current_path = None
+        self.entries = []
+        self.all_entries = []
+
+        self.original_order = []
+        self.playlist = []
+        self.play_index = -1
+        self.current_proc = None
+        self.current_rc_port = None
+        self.is_paused = False
+        self.autoplay_enabled = True
+        self.shuffle_enabled = False
+        self.play_session = 0
+        self._advance_requested = None
+        self.vlc_windows_hidden = False
+
+        self.update_autoplay_button()
+        self.update_shuffle_button()
+        self.update_vlc_button()
+
+        self._start_loading_dots()
+        threading.Thread(target=self._drive_poll_loop, daemon=True).start()
+
+    # ---------- Loading Animation ----------
+
+    def _animate_loading_dots(self):
+        if self.root_path is None:
+            dots = "." * ((self._dots_count % 3) + 1)
+            self.status_label.config(text=f"Looking for BERRY play drive{dots}")
+            self._dots_count += 1
+            self._dots_job = self.after(400, self._animate_loading_dots)
+
+    def _start_loading_dots(self):
+        if self._dots_job is not None:
+            return
+        self._dots_count = 0
+        self._animate_loading_dots()
+
+    def _stop_loading_dots(self):
+        if self._dots_job is not None:
+            self.after_cancel(self._dots_job)
+            self._dots_job = None
+
+    # ---------- Drive Polling ----------
+
+    def _drive_poll_loop(self):
+        while True:
+            path = find_drive_path()
+            if path:
+                if self.root_path != path:
+                    self.root_path = path
+                    if not self.current_path or not os.path.exists(self.current_path) or not os.path.normpath(self.current_path).startswith(os.path.normpath(self.root_path)):
+                        self.current_path = path
+                self.after(0, self.on_drive_found)
+            else:
+                if self.root_path is not None:
+                    self.root_path = None
+                    self.current_path = None
+                    self.after(0, self.on_drive_lost)
+            time.sleep(POLL_SECONDS)
+
+    def on_drive_found(self):
+        self._stop_loading_dots()
+        self.status_label.config(text=f"Found drive: {self.root_path}")
+        self.refresh_listing()
+
+    def on_drive_lost(self):
+        self.path_label.config(text="")
+        self.listbox.delete(0, tk.END)
+        self.entries = []
+        self.all_entries = []
+        self._start_loading_dots()
+
+    def handle_escape(self):
+        if self.search_var.get():
+            self.search_var.set("")
+        elif self.current_path and self.root_path and os.path.normpath(self.current_path) != os.path.normpath(self.root_path):
+            self.go_up()
+
+    def refresh_listing(self):
+        if not self.current_path or not os.path.exists(self.current_path):
+            return
+
+        self.path_label.config(text=self.current_path)
+
+        try:
+            items = sorted(os.listdir(self.current_path))
+        except OSError as e:
+            messagebox.showerror("Error", f"Could not read folder:\n{e}")
+            return
+
+        self.all_entries = []
+        for name in items:
+            full_path = os.path.join(self.current_path, name)
+            if name.lower().endswith(PLAYABLE_EXTENSIONS) and not os.path.isdir(full_path):
+                self.all_entries.append(("media", full_path))
+            elif os.path.isdir(full_path):
+                self.all_entries.append(("folder", full_path))
+
+        if self.search_var.get():
+            self.search_var.set("")
+        else:
+            self.apply_filter()
+
+    def apply_filter(self):
+        raw_query = self.search_var.get().strip()
+        query_lower = raw_query.lower()
+        self.listbox.delete(0, tk.END)
+        self.entries = []
+
+        if query_lower.startswith("@all"):
+            search_term = query_lower[5:].strip()
+            drive_files = self.build_drive_index()
+            for path in drive_files:
+                filename = os.path.basename(path)
+                display_name = os.path.splitext(filename)[0]
+                if search_term and search_term not in display_name.lower():
+                    continue
+
+                parent = os.path.dirname(path)
+                rel = os.path.relpath(parent, self.root_path) if self.root_path else ""
+                origin = "BERRY play" if rel in ("", ".") else rel.replace(os.sep, " / ")
+
+                self.listbox.insert(tk.END, f"  ♪  {display_name}   —  ({origin})")
+                self.entries.append(("media", path))
+        else:
+            for kind, path in self.all_entries:
+                name = os.path.basename(path)
+                display_name = os.path.splitext(name)[0] if kind == "media" else name
+                if query_lower and query_lower not in display_name.lower():
+                    continue
+                marker = "♪" if kind == "media" else "▸"
+                self.listbox.insert(tk.END, f"  {marker}  {display_name}")
+                self.entries.append((kind, path))
+
+    def open_selected(self):
+        selection = self.listbox.curselection()
+        if not selection:
+            return
+        kind, path = self.entries[selection[0]]
+
+        if kind == "folder":
+            self.current_path = path
+            self.refresh_listing()
+        else:
+            folder = os.path.dirname(path)
+            if self.root_path and os.path.normpath(folder) != os.path.normpath(self.current_path or ""):
+                self.current_path = folder
+
+            self.refresh_listing()
+            self.start_playback(path)
+
+    def go_up(self):
+        if not self.current_path:
+            return
+        parent = os.path.dirname(self.current_path)
+        if os.path.normpath(parent).startswith(os.path.normpath(self.root_path)) or IS_WINDOWS:
+            if parent and parent != self.current_path:
+                self.current_path = parent
+                self.refresh_listing()
+
+    # ---------- Playback Operations ----------
+
+    def start_playback(self, path):
+        playlist = [p for kind, p in self.all_entries if kind == "media"]
+        if path not in playlist:
+            return
+
+        self.original_order = playlist
+
+        if self.shuffle_enabled:
+            remaining = [p for p in playlist if p != path]
+            random.shuffle(remaining)
+            playlist = [path] + remaining
+            index = 0
+        else:
+            index = playlist.index(path)
+
+        self.playlist = playlist
+        self.play_index = index
+
+        self.play_session += 1
+        session = self.play_session
+
+        if self.current_proc and self.current_proc.poll() is None:
+            try:
+                self.current_proc.terminate()
+            except OSError:
+                pass
+
+        threading.Thread(target=self.playback_loop, args=(session,), daemon=True).start()
+
+    def playback_loop(self, session):
+        vlc_cmd = find_vlc()
+        if vlc_cmd is None:
+            self.after(0, lambda: messagebox.showerror(
+                "VLC not found",
+                "Couldn't find VLC.\n\n"
+                "Install on Raspberry Pi: sudo apt update && sudo apt install vlc"
+            ))
+            return
+
+        while True:
+            if session != self.play_session:
+                return
+            if not (0 <= self.play_index < len(self.playlist)):
+                self.after(0, lambda: self.status_label.config(text="Playlist finished"))
+                self.after(0, self.set_stopped_state)
+                return
+
+            path = self.playlist[self.play_index]
+            filename = os.path.basename(path)
+            display_name = os.path.splitext(filename)[0]
+
+            folder = os.path.dirname(path)
+            rel = os.path.relpath(folder, self.root_path) if self.root_path else ""
+            location = "BERRY play" if rel in ("", ".") else rel.replace(os.sep, " / ")
+
+            self.after(0, lambda n=filename: self.status_label.config(text=f"Playing: {n}"))
+            self.after(0, lambda n=display_name, l=location: self.set_now_playing(n, l))
+            self.after(0, self._stop_progress)
+            self.after(0, lambda: self._set_progress(0.0))
+
+            self.is_paused = False
+            self._advance_requested = None
+            self.after(0, self.set_playing_state)
+
+            rc_port = get_free_port()
+            vlc_args = [
+                vlc_cmd, "--play-and-exit",
+                "--extraintf", "rc",
+                "--rc-host", f"127.0.0.1:{rc_port}",
+                "--rc-quiet",
+            ]
+
+            # Raspberry Pi Pi3 A+ specific lightweight flags
+            if not IS_WINDOWS:
+                vlc_args.extend(["--no-video-title-show", "--aout=alsa"])
+
+            if self.vlc_windows_hidden:
+                vlc_args.append("--qt-start-minimized")
+            vlc_args.append(path)
+
+            try:
+                creationflags = subprocess.CREATE_NO_WINDOW if IS_WINDOWS else 0
+                proc = subprocess.Popen(
+                    vlc_args,
+                    creationflags=creationflags,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+            except FileNotFoundError:
+                self.after(0, lambda: messagebox.showerror(
+                    "VLC error", "Could not run VLC."
+                ))
+                return
+
+            self.current_proc = proc
+            self.current_rc_port = rc_port
+            self.after(0, self._start_progress)
+
+            if self.vlc_windows_hidden and IS_WINDOWS:
+                time.sleep(0.25)
+                wait_and_minimize_process_window(proc.pid)
+
+            proc.wait()
+
+            if self.current_proc is proc:
+                self.current_proc = None
+                self.current_rc_port = None
+
+            if session != self.play_session:
+                return
+
+            if self._advance_requested == "back":
+                self.play_index = max(0, self.play_index - 1)
+            elif self._advance_requested == "next":
+                self.play_index += 1
+            else:
+                if not self.autoplay_enabled:
+                    self.after(0, lambda: self.status_label.config(text="Stopped (autoplay off)"))
+                    self.after(0, self.set_stopped_state)
+                    return
+                self.play_index += 1
+
+    def send_rc_command(self, port, command, reply=False):
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.8) as s:
+                s.sendall((command + "\n").encode())
+                if reply:
+                    return s.recv(256).decode(errors="ignore")
+        except OSError:
+            pass
+        return None
+
+    # ---------- Control Actions ----------
+
+    def control_toggle_playpause(self):
+        if not self.current_proc or self.current_proc.poll() is not None:
+            return
+        self.send_rc_command(self.current_rc_port, "pause")
+        self.is_paused = not self.is_paused
+        if self.is_paused:
+            self.set_paused_state()
+            self.status_label.config(text=self.status_label.cget("text").replace("Playing:", "Paused:"))
+        else:
+            self.set_playing_state()
+            self.status_label.config(text=self.status_label.cget("text").replace("Paused:", "Playing:"))
+
+    def control_next(self):
+        if self.current_proc and self.current_proc.poll() is None:
+            self._advance_requested = "next"
+            self.current_proc.terminate()
+
+    def control_back(self):
+        if self.current_proc and self.current_proc.poll() is None:
+            self._advance_requested = "back"
+            self.current_proc.terminate()
+
+    def toggle_autoplay(self):
+        self.autoplay_enabled = not self.autoplay_enabled
+        self.update_autoplay_button()
+
+    def toggle_shuffle(self):
+        self.shuffle_enabled = not self.shuffle_enabled
+        self.update_shuffle_button()
+
+        if not self.playlist or not (0 <= self.play_index < len(self.playlist)):
+            return
+
+        already_played = self.playlist[: self.play_index + 1]
+        if self.shuffle_enabled:
+            remaining = self.playlist[self.play_index + 1:]
+            random.shuffle(remaining)
+        else:
+            played_set = set(already_played)
+            remaining = [p for p in self.original_order if p not in played_set]
+        self.playlist = already_played + remaining
+
+    def toggle_player_visibility(self):
+        self.vlc_windows_hidden = not self.vlc_windows_hidden
+
+        if IS_WINDOWS and CONSOLE_HWND:
+            ctypes.windll.user32.ShowWindow(CONSOLE_HWND, SW_HIDE)
+
+        if IS_WINDOWS and self.current_proc and self.current_proc.poll() is None:
+            set_process_window_state(self.current_proc.pid, minimize=self.vlc_windows_hidden)
+
+        self.update_vlc_button()
+
+    def build_drive_index(self):
+        index = []
+        if not self.root_path:
+            return index
+
+        for dirpath, dirnames, filenames in os.walk(self.root_path):
+            for fname in filenames:
+                if fname.lower().endswith(PLAYABLE_EXTENSIONS):
+                    index.append(os.path.join(dirpath, fname))
+        return index
+
+    # ---------- Dynamic UI & Controls State ----------
+
+    def update_autoplay_button(self):
+        if self.autoplay_enabled:
+            self.autoplay_button.config(fg=ACCENT, bg=ACCENT_BG, activebackground=ACCENT_BG)
+        else:
+            self.autoplay_button.config(fg=FG, bg=BG_PANEL, activebackground=BG_PANEL)
+
+    def update_shuffle_button(self):
+        if self.shuffle_enabled:
+            self.shuffle_button.config(fg=ACCENT, bg=ACCENT_BG, activebackground=ACCENT_BG)
+        else:
+            self.shuffle_button.config(fg=FG, bg=BG_PANEL, activebackground=BG_PANEL)
+
+    def update_vlc_button(self):
+        if self.vlc_windows_hidden:
+            self.vlc_button.config(fg=ACCENT, bg=ACCENT_BG, activebackground=ACCENT_BG)
+        else:
+            self.vlc_button.config(fg=FG, bg=BG_PANEL, activebackground=BG_PANEL)
+
+    def set_playing_state(self):
+        self.playpause_button.config(text="⏸")
+        self._start_progress()
+
+    def set_paused_state(self):
+        self.playpause_button.config(text="▶")
+
+    def set_stopped_state(self):
+        self.playpause_button.config(text="▶")
+        self._stop_marquee()
+        self._stop_progress()
+        self._set_progress(0.0)
+        self.now_playing_label.config(text="Nothing playing")
+        self.location_label.config(text="")
+
+    def set_now_playing(self, name, location=None):
+        self._stop_marquee()
+        self._marquee_text = name
+        self._marquee_pos = 0
+
+        if location:
+            display_loc = location if len(location) <= 30 else location[:28] + "…"
+            self.location_label.config(text=f" · {display_loc}")
+        else:
+            self.location_label.config(text="")
+
+        if len(name) > 35:
+            self._animate_marquee()
+        else:
+            self.now_playing_label.config(text=name)
+
+    def _animate_marquee(self):
+        text = self._marquee_text + "   •   "
+        exp_display = (text[self._marquee_pos:] + text[:self._marquee_pos])[:35]
+        self.now_playing_label.config(text=exp_display)
+        self._marquee_pos = (self._marquee_pos + 1) % len(text)
+        self._marquee_job = self.after(350, self._animate_marquee)
+
+    def _stop_marquee(self):
+        if self._marquee_job is not None:
+            self.after_cancel(self._marquee_job)
+            self._marquee_job = None
+
+    # ---------- Progress Bar Updates ----------
+
+    def _set_progress(self, fraction):
+        fraction = max(0.0, min(1.0, fraction))
+        width = max(1, self.progress_canvas.winfo_width())
+        self.progress_canvas.coords(
+            self.progress_fill, 0, 0, width * fraction, 6
+        )
+
+    def _start_progress(self):
+        self._stop_progress()
+        self._progress_last_time = None
+        self._progress_last_timestamp = None
+        self._progress_length = 0.0
+        self._progress_job = self.after(100, self._update_progress)  # Optimized to 100ms for Pi 3 A+ CPU
+
+    def _stop_progress(self):
+        if self._progress_job is not None:
+            self.after_cancel(self._progress_job)
+            self._progress_job = None
+
+    def _update_progress(self):
+        proc = self.current_proc
+        port = self.current_rc_port
+
+        if proc is None or proc.poll() is not None or port is None:
+            self._progress_job = None
+            return
+
+        now = time.monotonic()
+
+        try:
+            reply = self.send_rc_command(port, "get_time", reply=True)
+            length_reply = self.send_rc_command(port, "get_length", reply=True)
+            current = float(reply.strip())
+            length = float(length_reply.strip())
+
+            if length > 0:
+                self._progress_length = length
+                self._progress_last_time = current
+                self._progress_last_timestamp = now
+        except (ValueError, TypeError, AttributeError):
+            pass
+
+        if self._progress_last_time is not None and self._progress_last_timestamp is not None:
+            estimated = self._progress_last_time + ((now - self._progress_last_timestamp) * 1000.0)
+            self._set_progress(estimated / self._progress_length)
+
+        self._progress_job = self.after(100, self._update_progress)
+
+    def control_quit(self):
+        self._stop_loading_dots()
+        self._stop_marquee()
+        self._stop_progress()
+        self.play_session += 1
+
+        if self.current_proc and self.current_proc.poll() is None:
+            try:
+                self.current_proc.terminate()
+            except OSError:
+                pass
+        self.destroy()
+
+
+if __name__ == "__main__":
+    hide_console_window()
+    app = PlayerApp()
+    app.mainloop()
