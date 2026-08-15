@@ -229,13 +229,30 @@ def find_vlc():
     if IS_WINDOWS:
         for path in WINDOWS_VLC_PATHS:
             if os.path.isfile(path):
-                return path
+                return [path]
         vlc_in_path = shutil.which("vlc.exe") or shutil.which("vlc")
         if vlc_in_path:
-            return vlc_in_path
+            return [vlc_in_path]
         return None
     else:
-        return shutil.which("cvlc") or shutil.which("vlc") or "vlc"
+        # Native binary (apt/dnf/etc installed VLC)
+        native = shutil.which("cvlc") or shutil.which("vlc")
+        if native:
+            return [native]
+        # Fall back to a Flatpak install of VLC (common on atomic/immutable
+        # distros, where VLC usually isn't installed natively and doesn't
+        # expose a "vlc" binary on PATH)
+        if shutil.which("flatpak"):
+            try:
+                check = subprocess.run(
+                    ["flatpak", "list", "--app", "--columns=application"],
+                    capture_output=True, text=True
+                )
+                if "org.videolan.VLC" in check.stdout:
+                    return ["flatpak", "run", "org.videolan.VLC"]
+            except Exception:
+                pass
+        return None
 
 
 def get_free_port():
@@ -329,6 +346,14 @@ class PlayerApp(tk.Tk):
 
         self.bind("<Escape>", lambda e: self.handle_escape())
         self.bind("<FocusOut>", self.on_focus_out)
+
+        # Arrow-key navigation bound at the window level (bind_all) so it
+        # works no matter which child widget currently has focus (e.g. the
+        # search entry). This also helps on Linux, where WM focus handling
+        # for override-redirect windows can be inconsistent.
+        self.bind_all("<Up>", lambda e: self._move_selection(-1))
+        self.bind_all("<Down>", lambda e: self._move_selection(1))
+        self.bind_all("<Return>", lambda e: self.open_selected())
 
         self.status_label = tk.Label(self.container, text="Looking for BERRY play drive.",
                                       bg=BG, fg=FG_MUTED, font=FONT_SMALL, anchor="w")
@@ -564,6 +589,19 @@ class PlayerApp(tk.Tk):
     def on_enter_key(self, event):
         self.open_selected()
 
+    def _move_selection(self, delta):
+        """Moves the listbox selection up/down by `delta`, regardless of
+        which widget currently has keyboard focus."""
+        if not self.entries:
+            return
+        current = self.listbox.curselection()
+        idx = current[0] if current else -1
+        new_idx = max(0, min(len(self.entries) - 1, idx + delta))
+        self.listbox.selection_clear(0, tk.END)
+        self.listbox.selection_set(new_idx)
+        self.listbox.activate(new_idx)
+        self.listbox.see(new_idx)
+
     def open_selected(self):
         selection = self.listbox.curselection()
         if not selection:
@@ -744,7 +782,7 @@ class PlayerApp(tk.Tk):
 
             rc_port = get_free_port()
             vlc_args = [
-                vlc_cmd,
+                *vlc_cmd,
                 "--fullscreen",
                 "--play-and-exit",
                 "--extraintf", "rc",
@@ -1024,6 +1062,18 @@ class PlayerApp(tk.Tk):
         self.deiconify()
         self.is_minimized = False
 
+        # Explicitly request window-manager focus, then grab all keyboard
+        # input. On Linux (especially Wayland compositors), WMs frequently
+        # refuse to hand keyboard focus to override-redirect windows, so
+        # without this, keys like arrows/Escape/typing can silently pass
+        # through to whatever window was focused before this one appeared.
+        self.lift()
+        self.focus_force()
+        try:
+            self.grab_set_global()
+        except tk.TclError:
+            pass
+
         self._suppress_dismiss(0.8)
         self._bring_main_above_vlc()
         self._start_topmost_guard()
@@ -1050,6 +1100,10 @@ class PlayerApp(tk.Tk):
             return
 
         self._stop_topmost_guard()
+        try:
+            self.grab_release()
+        except tk.TclError:
+            pass
         self.island.update_search_button(False)
         self.update_idletasks()
         self.island.update_idletasks()
